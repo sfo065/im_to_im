@@ -9,6 +9,67 @@ sys.path.append(os.path.abspath('../raw_to_map'))
 from sfkb_to_image_coordinates.sfkb_to_graph_dup import get_camera_extrinsics, utm_to_image
 from tqdm import tqdm
 from collections import defaultdict
+import rasterio
+from rasterio.windows import Window
+
+def point_exists_in_dict(existing_dict, new_point, tolerance):
+    for image_id, point in existing_dict.items():
+        if point.distance(new_point) <= tolerance:
+            return image_id  # Return the key (image) where the point matches
+    return None
+
+# Function to add a match to the list of dictionaries
+def add_match(match_list, im1, pt1, im2, pt2, tolerance=1e-6):
+    match_found = False
+    for match_dict in match_list:
+        # Check if pt1 already exists in the match dictionary
+        existing_image = point_exists_in_dict(match_dict, pt1, tolerance)
+        if existing_image:
+            # Add the new point-image pair (im2: pt2) to the existing match
+            match_dict[im2] = pt2
+            match_found = True
+            break
+        # Also check if pt2 exists (and add pt1 if necessary)
+        existing_image = point_exists_in_dict(match_dict, pt2, tolerance)
+        if existing_image:
+            match_dict[im1] = pt1
+            match_found = True
+            break
+    
+    # If no existing match was found, create a new match dictionary
+    if not match_found:
+        new_match = {im1: pt1, im2: pt2}
+        match_list.append(new_match)
+    
+def add_single_point(match_list, im1, p1, tolerance=1e-6):
+    """
+    Adds a single point {im1: p1} to the match list if it does not already exist.
+
+    Args:
+        match_list: List of dictionaries storing matched points.
+        im1: Image ID of the point.
+        p1: Shapely Point to be added.
+        tolerance: Distance tolerance to determine point equality.
+
+    Returns:
+        None (modifies match_list in place).
+    """
+    point_exists = False
+
+    # Iterate through all dictionaries in match_list
+    for match_dict in match_list:
+        for image_id, point in match_dict.items():
+            # Check if the current point already exists (within tolerance)
+            if image_id == im1 and point.distance(p1) <= tolerance:
+                point_exists = True
+                break  # Exit inner loop
+        if point_exists:
+            break  # Exit outer loop if point is found
+
+    # If the point doesn't exist, add it as a new dictionary
+    if not point_exists:
+        match_list.append({im1: p1})
+
 
 def load_buildings(folder_path="../results/objects"):
     # List to store all loaded objects
@@ -213,7 +274,7 @@ def simplify_polygon(polygon):
     # Create and return the simplified polygon
     return Polygon(simplified_points)
 
-def adjust_to_border(points, tolerance=1000):
+def snap_to_border(points, tolerance=1000):
     x_min = 0
     x_max = 17004
     y_min = 0
@@ -245,7 +306,7 @@ def get_overlap(iid1, iid2):
 
         intersect = simplify_polygon(coverage[iid1].intersection(coverage[iid2]))
         utm_box = np.vstack([np.vstack(intersect.exterior.xy), np.zeros(5)]).T
-        box = Polygon(adjust_to_border(utm_to_image(utm_box, iid1, settings['inpho_path']))).convex_hull
+        box = Polygon(snap_to_border(utm_to_image(utm_box, iid1, settings['inpho_path']))).convex_hull
     else:
         box = None
     return box
@@ -312,4 +373,70 @@ def match_points(p1, p2, iid1, iid2, tol=1e-2):
     else: 
         print (f'Images {iid1} and {iid2} do not overlap')
         return
-    
+
+def get_true_matches(iid1, iid2, buildings):
+    true_matches = dict()
+    for building in buildings:
+        iids = building['corners'].keys()
+        if iid1 in iids and iid2 in iids:
+            p1 = Point(np.round(np.mean(np.array(list(building['corners'][iid1])), axis=0), 6))
+            p2 = Point(np.round(np.mean(np.array(list(building['corners'][iid2])), axis=0), 6))
+            true_matches[p1] = p2
+    return true_matches
+
+def main(overlap, buildings_pt, print_metrics=False, buildings_true=None):
+    # Set to track processed pairs
+    processed_pairs = set()
+    matches = []
+    mult_matches = []
+
+    # Iterate over the dictionary and process overlaps
+    for iid1, overlapping_iids in overlap.items():
+        for iid2 in overlapping_iids:
+            # Create a pair tuple (ordered to avoid duplication)
+            pair = tuple(sorted([int(iid1.split('_')[-1]), int(iid2.split('_')[-1])]))
+            # Check if the pair has already been processed
+            if pair not in processed_pairs:
+                # Call the matching function
+                
+                inferred_matches, mult_match, unmatched = match_points(buildings_pt[iid1], buildings_pt[iid2], iid1, iid2)
+                # Add the pair to the processed set
+                processed_pairs.add(pair)
+                
+                if print_metrics:
+                    true_matches = get_true_matches(iid1, iid2, buildings_true)                    
+                    TP = 0
+                for m in inferred_matches:
+                    add_match(matches, iid1, m, iid2, inferred_matches[m])
+                    if print_metrics:
+                        if inferred_matches[m] == true_matches[m]:
+                            TP += 1
+
+                for p in unmatched:
+                    add_single_point(matches, iid1, p)
+
+                if len(mult_match) > 0:
+                    mult_matches.append({iid1:tuple(mult_match.keys()), iid2:tuple(mult_match.values())})
+                
+                if print_metrics:
+                    mult_tot = sum([len(m) for m in mult_match])
+                    precision = round(TP/len(inferred_matches), 4)
+                    recall = round(TP/len(true_matches), 4)
+                    F1 = round(2*precision*recall/(precision+recall), 4)
+                    
+                if print_metrics:
+                    print (f'{iid1.split("_")[-1]}-{iid2.split("_")[-1]}: Precision:{precision} -- Recall {recall} --F1: {F1} -- N matches: {len(inferred_matches)} -- mult match:{mult_tot}\n')
+    return matches, mult_matches
+
+def plot_matches(match, width, cog_path):
+    n = len(match)
+    _, axs = plt.subplots(1, n, figsize=(4*n, 4))
+    for ax, iid in zip(axs.flatten(),match):
+        x, y = match[iid].xy
+        window = Window(x[0]-width/2, y[0]-width/2, width, width)
+
+        with rasterio.open(f"{cog_path}/{iid}.tif") as src:
+            image = src.read(window=window)
+            image = np.moveaxis(image, 0, -1)
+        ax.imshow(image)
+        ax.scatter(width/2, width/2, c='red')
